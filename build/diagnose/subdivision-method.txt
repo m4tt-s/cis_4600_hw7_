@@ -1,0 +1,129 @@
+bool Mesh::subdivideCatmullClark() {
+    if (faces.empty()) return false;
+
+    std::unordered_set<HalfEdge*> ownedEdges;
+    std::unordered_set<Vertex*> ownedVertices;
+    for (const auto& edge : halfEdges) ownedEdges.insert(edge.get());
+    for (const auto& vertex : vertices) ownedVertices.insert(vertex.get());
+    std::unordered_set<HalfEdge*> visited;
+    std::unordered_map<Vertex*, size_t> incidentCounts;
+    std::unordered_map<Face*, glm::vec3> faceCentroids;
+    std::unordered_map<HalfEdge*, HalfEdge*> previous;
+    for (const auto& face : faces) {
+        HalfEdge* start = face->halfEdge;
+        HalfEdge* edge = start;
+        glm::vec3 sum(0.0f);
+        size_t count = 0;
+        do {
+            if (!ownedEdges.contains(edge) || !visited.insert(edge).second ||
+                edge->face != face.get() || !ownedVertices.contains(edge->vertex) ||
+                !ownedEdges.contains(edge->next)) return false;
+            sum += edge->vertex->position;
+            ++incidentCounts[edge->vertex];
+            previous[edge->next] = edge;
+            ++count;
+            edge = edge->next;
+        } while (edge != start);
+        if (count < 3) return false;
+        faceCentroids[face.get()] = sum / static_cast<float>(count);
+    }
+    if (visited.size() != halfEdges.size()) return false;
+
+    std::unordered_map<HalfEdge*, glm::vec3> edgePoints;
+    for (const auto& owner : halfEdges) {
+        HalfEdge* edge = owner.get();
+        HalfEdge* sym = edge->sym;
+        if (!ownedEdges.contains(sym) || sym == edge || sym->sym != edge ||
+            previous.at(edge)->vertex != sym->vertex ||
+            previous.at(sym)->vertex != edge->vertex) return false;
+        if (edgePoints.contains(edge)) continue;
+        glm::vec3 point = (edge->vertex->position + sym->vertex->position +
+                          faceCentroids.at(edge->face) + faceCentroids.at(sym->face)) / 4.0f;
+        edgePoints[edge] = point;
+        edgePoints[sym] = point;
+    }
+
+    std::unordered_map<Vertex*, glm::vec3> updatedPositions;
+    for (const auto& owner : vertices) {
+        Vertex* vertex = owner.get();
+        HalfEdge* start = vertex->halfEdge;
+        HalfEdge* edge = start;
+        glm::vec3 sumEdges(0.0f), sumFaces(0.0f);
+        size_t count = 0;
+        do {
+            if (!ownedEdges.contains(edge) || edge->vertex != vertex ||
+                ++count > incidentCounts[vertex]) return false;
+            sumEdges += edgePoints.at(edge);
+            sumFaces += faceCentroids.at(edge->face);
+            edge = edge->next->sym;
+        } while (edge != start);
+        if (count != incidentCounts[vertex]) return false;
+        float n = static_cast<float>(count);
+        updatedPositions[vertex] = ((n - 2.0f) / n) * vertex->position +
+                                   (sumEdges + sumFaces) / (n * n);
+    }
+
+    std::vector<std::unique_ptr<Vertex>> newVertices;
+    std::vector<std::unique_ptr<Face>> newFaces;
+    std::vector<std::unique_ptr<HalfEdge>> newEdges;
+    newVertices.reserve(vertices.size() + halfEdges.size() / 2 + faces.size());
+    newFaces.reserve(halfEdges.size());
+    newEdges.reserve(4 * halfEdges.size());
+    auto addVertex = [&](const glm::vec3& position) {
+        newVertices.push_back(std::make_unique<Vertex>(position));
+        return newVertices.back().get();
+    };
+    std::unordered_map<Vertex*, Vertex*> vertexCopies;
+    std::unordered_map<Face*, Vertex*> faceVertices;
+    std::unordered_map<HalfEdge*, Vertex*> edgeVertices;
+    for (const auto& vertex : vertices)
+        vertexCopies[vertex.get()] = addVertex(updatedPositions.at(vertex.get()));
+    for (const auto& face : faces)
+        faceVertices[face.get()] = addVertex(faceCentroids.at(face.get()));
+    for (const auto& edge : halfEdges) {
+        if (edgeVertices.contains(edge.get())) continue;
+        Vertex* point = addVertex(edgePoints.at(edge.get()));
+        edgeVertices[edge.get()] = point;
+        edgeVertices[edge->sym] = point;
+    }
+
+    std::unordered_map<Vertex*, std::unordered_map<Vertex*, HalfEdge*>> directedEdges;
+    for (const auto& face : faces) {
+        HalfEdge* start = face->halfEdge;
+        HalfEdge* edge = start;
+        do {
+            Vertex* corners[4] = {vertexCopies.at(edge->vertex),
+                                  edgeVertices.at(edge->next),
+                                  faceVertices.at(face.get()), edgeVertices.at(edge)};
+            auto quad = std::make_unique<Face>(face->color);
+            HalfEdge* loop[4];
+            for (int i = 0; i < 4; ++i) {
+                newEdges.push_back(std::make_unique<HalfEdge>());
+                loop[i] = newEdges.back().get();
+                loop[i]->vertex = corners[(i + 1) % 4];
+                loop[i]->face = quad.get();
+                loop[i]->vertex->halfEdge = loop[i];
+                if (!directedEdges[corners[i]].emplace(corners[(i + 1) % 4], loop[i]).second)
+                    return false;
+            }
+            for (int i = 0; i < 4; ++i) loop[i]->next = loop[(i + 1) % 4];
+            quad->halfEdge = loop[0];
+            newFaces.push_back(std::move(quad));
+            edge = edge->next;
+        } while (edge != start);
+    }
+    for (const auto& [from, outgoing] : directedEdges) {
+        for (const auto& [to, edge] : outgoing) {
+            auto reverseFrom = directedEdges.find(to);
+            if (reverseFrom == directedEdges.end()) return false;
+            auto reverse = reverseFrom->second.find(from);
+            if (reverse == reverseFrom->second.end()) return false;
+            edge->sym = reverse->second;
+        }
+    }
+    vertices.swap(newVertices);
+    faces.swap(newFaces);
+    halfEdges.swap(newEdges);
+    return true;
+}
+
